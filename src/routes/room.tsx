@@ -16,9 +16,15 @@ import { supabase } from "@/integrations/supabase/client";
 import { useAuth, type Profile } from "@/hooks/useAuth";
 import { isGateUnlocked, lockGate } from "@/lib/gate-session";
 import { useCall } from "@/hooks/useCall";
+import { usePresence } from "@/hooks/usePresence";
+import { useAppLock } from "@/hooks/useAppLock";
 import { ChatWindow } from "@/components/chat/ChatWindow";
 import { CallOverlay } from "@/components/chat/CallOverlay";
 import { UserAvatar } from "@/components/chat/UserAvatar";
+import { AvatarCropper } from "@/components/chat/AvatarCropper";
+import { MediaViewer, type ViewerItem } from "@/components/chat/MediaViewer";
+import { getNicknames } from "@/lib/chat-prefs";
+import { useSignedUrl } from "@/components/SignedImage";
 import { uploadFile } from "@/lib/media";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -52,6 +58,7 @@ function RoomPage() {
   const navigate = useNavigate();
   const { session, profile, loading, refreshProfile, signOut } = useAuth();
   const call = useCall(session?.user.id);
+  const onlineIds = usePresence(session?.user.id);
 
   const [tab, setTab] = useState<Tab>("chats");
   const [friends, setFriends] = useState<Profile[]>([]);
@@ -60,6 +67,10 @@ function RoomPage() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Profile[]>([]);
   const [sentTo, setSentTo] = useState<string[]>([]);
+  const [nicknames, setNicknames] = useState<Record<string, string>>({});
+
+  // Leaving the app re-locks the private area, so the access key is needed again.
+  useAppLock(Boolean(session));
 
   useEffect(() => {
     if (loading) return;
@@ -67,6 +78,41 @@ function RoomPage() {
       void navigate({ to: isGateUnlocked() ? "/auth" : "/" });
     }
   }, [session, loading]);
+
+  useEffect(() => {
+    if (!session) return;
+    const sync = () => setNicknames(getNicknames(session.user.id));
+    sync();
+    window.addEventListener("srt-nicknames", sync);
+    return () => window.removeEventListener("srt-nicknames", sync);
+  }, [session?.user.id]);
+
+  const nameOf = (p: Profile) => nicknames[p.id] || p.display_name || p.username;
+
+  // Mark every incoming message as delivered while this user is online.
+  useEffect(() => {
+    if (!session) return;
+    const me = session.user.id;
+    const markAll = async () => {
+      await supabase
+        .from("messages")
+        .update({ delivered_at: new Date().toISOString() })
+        .eq("receiver_id", me)
+        .is("delivered_at", null);
+    };
+    void markAll();
+    const channel = supabase
+      .channel("delivery-watch")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "messages", filter: `receiver_id=eq.${me}` },
+        () => void markAll(),
+      )
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [session?.user.id]);
 
   const loadRelations = useCallback(async () => {
     if (!session) return;
@@ -165,20 +211,20 @@ function RoomPage() {
   const peerForCall = friends.find((f) => f.id === call.peerId) ?? active;
 
   return (
-    <div className="h-screen bg-background md:flex">
+    <div className="h-[100dvh] overflow-hidden bg-background md:flex">
       <CallOverlay
         call={call}
-        peerName={peerForCall?.display_name || peerForCall?.username || "Unknown"}
+        peerName={peerForCall ? nameOf(peerForCall) : "Unknown"}
         peerAvatar={peerForCall?.avatar_url}
       />
 
       {/* Sidebar */}
       <aside
-        className={`flex h-full w-full flex-col border-r border-border bg-surface md:w-80 lg:w-96 ${
+        className={`flex h-full min-h-0 w-full flex-col border-r border-border bg-surface md:w-80 lg:w-96 ${
           active ? "hidden md:flex" : "flex"
         }`}
       >
-        <header className="flex items-center gap-2 border-b border-border px-3 py-2.5">
+        <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2.5">
           <UserAvatar path={profile.avatar_url} name={profile.display_name || profile.username} size={38} />
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-semibold">{profile.display_name || profile.username}</p>
@@ -197,7 +243,7 @@ function RoomPage() {
           </button>
         </header>
 
-        <div className="flex border-b border-border text-sm">
+        <div className="flex shrink-0 border-b border-border text-sm">
           {(
             [
               ["chats", "Chats", MessageSquarePlus],
@@ -220,7 +266,7 @@ function RoomPage() {
           ))}
         </div>
 
-        <div className="flex-1 overflow-y-auto">
+        <div className="min-h-0 flex-1 overflow-y-auto">
           {tab === "chats" && (
             <>
               {incoming.length > 0 && (
@@ -267,14 +313,25 @@ function RoomPage() {
                       active?.id === f.id ? "bg-muted" : ""
                     }`}
                   >
-                    <UserAvatar
-                      path={f.avatar_url}
-                      name={f.display_name || f.username}
-                      hidden={!f.show_avatar}
-                    />
+                    <div className="relative shrink-0">
+                      <UserAvatar
+                        path={f.avatar_url}
+                        name={nameOf(f)}
+                        hidden={!f.show_avatar}
+                      />
+                      {onlineIds.includes(f.id) && (
+                        <span className="absolute -bottom-0.5 -right-0.5 h-3.5 w-3.5 rounded-full border-2 border-surface bg-emerald-500" />
+                      )}
+                    </div>
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium">{f.display_name || f.username}</p>
-                      <p className="truncate text-xs text-muted-foreground">@{f.username}</p>
+                      <p className="truncate text-sm font-medium">{nameOf(f)}</p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {onlineIds.includes(f.id) ? (
+                          <span className="text-emerald-600">online</span>
+                        ) : (
+                          `@${f.username}`
+                        )}
+                      </p>
                     </div>
                   </button>
                 ))
@@ -338,11 +395,12 @@ function RoomPage() {
       </aside>
 
       {/* Chat area */}
-      <main className={`h-full flex-1 ${active ? "block" : "hidden md:block"}`}>
+      <main className={`h-full min-h-0 flex-1 ${active ? "block" : "hidden md:block"}`}>
         {active ? (
           <ChatWindow
             me={profile}
             peer={active}
+            peerOnline={onlineIds.includes(active.id)}
             onBack={() => setActive(null)}
             onCall={(kind) => void call.startCall(active.id, kind)}
           />
@@ -360,6 +418,9 @@ function ProfileEditor({ profile, onSaved }: { profile: Profile; onSaved: () => 
   const [name, setName] = useState(profile.display_name ?? "");
   const [about, setAbout] = useState(profile.about ?? "");
   const [busy, setBusy] = useState(false);
+  const [cropFile, setCropFile] = useState<File | null>(null);
+  const [viewer, setViewer] = useState<ViewerItem | null>(null);
+  const myAvatarUrl = useSignedUrl("avatars", profile.avatar_url);
 
   const update = async (patch: Record<string, unknown>) => {
     const { error } = await supabase
@@ -370,13 +431,13 @@ function ProfileEditor({ profile, onSaved }: { profile: Profile; onSaved: () => 
     else await onSaved();
   };
 
-  const onAvatar = async (file: File) => {
+  const saveCropped = async (blob: Blob) => {
     setBusy(true);
     try {
-      const ext = file.name.split(".").pop() || "jpg";
-      const path = await uploadFile("avatars", profile.id, file, ext);
+      const path = await uploadFile("avatars", profile.id, blob, "jpg");
       await update({ avatar_url: path });
       toast.success("Profile picture updated.");
+      setCropFile(null);
     } catch {
       toast.error("Could not upload that picture.");
     } finally {
@@ -386,24 +447,36 @@ function ProfileEditor({ profile, onSaved }: { profile: Profile; onSaved: () => 
 
   return (
     <div className="space-y-5 p-4">
+      <AvatarCropper file={cropFile} onCancel={() => setCropFile(null)} onDone={saveCropped} />
+      <MediaViewer item={viewer} onClose={() => setViewer(null)} />
+
       <div className="flex flex-col items-center gap-2">
-        <label className="relative cursor-pointer">
-          <UserAvatar path={profile.avatar_url} name={profile.display_name || profile.username} size={88} />
-          <span className="absolute bottom-0 right-0 rounded-full bg-primary p-1.5 text-primary-foreground">
-            <Camera className="h-3.5 w-3.5" />
-          </span>
-          <input
-            type="file"
-            accept="image/*"
-            className="hidden"
-            disabled={busy}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) void onAvatar(file);
-              e.target.value = "";
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => {
+              if (myAvatarUrl) setViewer({ url: myAvatarUrl, kind: "avatar", name: profile.username });
             }}
-          />
-        </label>
+            className="rounded-full"
+            aria-label="Open my photo"
+          >
+            <UserAvatar path={profile.avatar_url} name={profile.display_name || profile.username} size={88} />
+          </button>
+          <label className="absolute bottom-0 right-0 cursor-pointer rounded-full bg-primary p-1.5 text-primary-foreground">
+            <Camera className="h-3.5 w-3.5" />
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              disabled={busy}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) setCropFile(file);
+                e.target.value = "";
+              }}
+            />
+          </label>
+        </div>
         <p className="text-sm font-semibold">@{profile.username}</p>
         <button
           onClick={() => {
